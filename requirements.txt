@@ -1,3 +1,4 @@
 Flask>=3.0,<4
 python-telegram-bot>=22,<23
 stripe>=12,<13
+gunicorn>=23,<24
