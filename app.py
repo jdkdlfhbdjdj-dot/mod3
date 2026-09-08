@@ -3,11 +3,10 @@ import os
 import secrets
 import threading
 import time
-from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 try:
     import stripe
@@ -40,12 +39,10 @@ def db():
         raise RuntimeError("psycopg is required")
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is required")
-    # Supabase's Session Pooler is IPv4-compatible and suitable for Render.
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 def init_db():
-    # Schema is managed in Supabase migrations. This check keeps startup explicit.
     conn = db()
     try:
         with conn.cursor() as cur:
@@ -55,10 +52,6 @@ def init_db():
                 raise RuntimeError("Supabase schema is missing public.users")
     finally:
         conn.close()
-
-
-def now():
-    return int(time.time())
 
 
 def save_user(tg_user, referrer=None):
@@ -82,7 +75,23 @@ def save_user(tg_user, referrer=None):
         conn.close()
 
 
+def get_oxshare_offer():
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, name, affiliate_url FROM public.offers "
+                "WHERE lower(name)='oxshare' AND active=true ORDER BY id LIMIT 1"
+            )
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
 def create_click(user_id, campaign_code="default", offer_id=None):
+    if offer_id is None:
+        offer = get_oxshare_offer()
+        offer_id = offer["id"] if offer else None
     click_id = secrets.token_urlsafe(12).replace("-", "").replace("_", "")[:16]
     conn = db()
     try:
@@ -110,23 +119,23 @@ def get_stats():
                   (SELECT COALESCE(SUM(commission),0) FROM public.conversions WHERE status IN ('approved','paid')) AS commission
                 """
             )
-            row = cur.fetchone()
-            return dict(row)
+            return dict(cur.fetchone())
     finally:
         conn.close()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    args = context.args
-    ref = args[0] if args else None
+    ref = context.args[0] if context.args else None
     save_user(user, referrer=ref)
     click_id = create_click(user.id, campaign_code=ref or "default")
+    offer = get_oxshare_offer()
 
-    keyboard = [
-        [InlineKeyboardButton("🚀 Get Started", callback_data="noop")],
-        [InlineKeyboardButton("💎 Premium with Stars", callback_data="stars")],
-    ]
+    keyboard = []
+    if offer:
+        keyboard.append([InlineKeyboardButton("🚀 Open Oxshare", url=offer["affiliate_url"])])
+    keyboard.append([InlineKeyboardButton("💎 Premium with Stars", callback_data="stars")])
+
     text = (
         f"Welcome to Stone, {user.first_name or 'there'}!\n\n"
         "Your account is registered and your referral source has been tracked.\n\n"
@@ -173,6 +182,13 @@ async def stars_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         currency="XTR",
         prices=[LabeledPrice("Premium", STARS_PRICE)],
     )
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "stars":
+        await stars_cmd(update, context)
 
 
 def stripe_checkout(click_id, user_id):
@@ -301,9 +317,10 @@ def main():
     application.add_handler(CommandHandler("link", link_cmd))
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("stars", stars_cmd))
+    application.add_handler(CallbackQueryHandler(button_callback))
 
     threading.Thread(target=run_http, daemon=True).start()
-    log.info("StoneDigger starting with Supabase PostgreSQL")
+    log.info("StoneDigger starting with Supabase PostgreSQL and Oxshare only")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
