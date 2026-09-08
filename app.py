@@ -419,7 +419,7 @@ def dashboard_data():
                 FROM public.users u
                 LEFT JOIN public.users r ON r.referred_by_telegram_user_id = u.telegram_user_id
                 GROUP BY u.telegram_user_id, u.username, u.first_name, u.activity_count, u.streak
-                ORDER BY referrals DESC, activity DESC, u.created_at ASC LIMIT 20
+                ORDER BY referrals DESC, activity DESC LIMIT 20
                 """
             )
             top_referrers = cur.fetchall()
