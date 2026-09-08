@@ -2,7 +2,7 @@ import logging
 import os
 import secrets
 import threading
-import time
+from datetime import date, timedelta
 
 from flask import Flask, jsonify, request
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Update
@@ -54,16 +54,43 @@ def init_db():
         conn.close()
 
 
+def parse_referrer(ref):
+    if not ref or not ref.startswith("ref_u"):
+        return None
+    raw = ref[5:]
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def save_user(tg_user, referrer=None):
     conn = db()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT referrer_code FROM public.users WHERE telegram_user_id=%s", (tg_user.id,))
+            cur.execute(
+                "SELECT telegram_user_id, referrer_code, referred_by_telegram_user_id FROM public.users WHERE telegram_user_id=%s",
+                (tg_user.id,),
+            )
             existing = cur.fetchone()
             if existing is None:
+                referrer_id = parse_referrer(referrer)
+                if referrer_id == tg_user.id:
+                    referrer_id = None
+                if referrer_id:
+                    cur.execute(
+                        "SELECT 1 FROM public.users WHERE telegram_user_id=%s",
+                        (referrer_id,),
+                    )
+                    if not cur.fetchone():
+                        referrer_id = None
                 cur.execute(
-                    "INSERT INTO public.users(telegram_user_id,username,first_name,referrer_code) VALUES(%s,%s,%s,%s)",
-                    (tg_user.id, tg_user.username, tg_user.first_name, referrer),
+                    """
+                    INSERT INTO public.users
+                    (telegram_user_id, username, first_name, referrer_code, referred_by_telegram_user_id)
+                    VALUES (%s,%s,%s,%s,%s)
+                    """,
+                    (tg_user.id, tg_user.username, tg_user.first_name, referrer, referrer_id),
                 )
             else:
                 cur.execute(
@@ -71,6 +98,51 @@ def save_user(tg_user, referrer=None):
                     (tg_user.username, tg_user.first_name, tg_user.id),
                 )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def get_user_stats(user_id):
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT activity_count, streak, last_dig_date,
+                       (SELECT COUNT(*) FROM public.users r WHERE r.referred_by_telegram_user_id = u.telegram_user_id) AS referrals
+                FROM public.users u
+                WHERE telegram_user_id=%s
+                """,
+                (user_id,),
+            )
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def record_dig(user_id):
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT activity_count, streak, last_dig_date FROM public.users WHERE telegram_user_id=%s FOR UPDATE",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            today = date.today()
+            last_dig = row["last_dig_date"]
+            if last_dig == today:
+                return {"dug": False, "activity": row["activity_count"], "streak": row["streak"]}
+            new_streak = (row["streak"] or 0) + 1 if last_dig == today - timedelta(days=1) else 1
+            new_activity = (row["activity_count"] or 0) + 1
+            cur.execute(
+                "UPDATE public.users SET activity_count=%s, streak=%s, last_dig_date=%s, last_seen_at=now() WHERE telegram_user_id=%s",
+                (new_activity, new_streak, today, user_id),
+            )
+        conn.commit()
+        return {"dug": True, "activity": new_activity, "streak": new_streak}
     finally:
         conn.close()
 
@@ -106,6 +178,25 @@ def create_click(user_id, campaign_code="default", offer_id=None):
     return click_id
 
 
+def leaderboard(limit=10):
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(username, first_name, 'Miner') AS display_name,
+                       activity_count, streak
+                FROM public.users
+                ORDER BY activity_count DESC, streak DESC, created_at ASC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
 def get_stats():
     conn = db()
     try:
@@ -124,33 +215,46 @@ def get_stats():
         conn.close()
 
 
+def main_keyboard(offer):
+    keyboard = [[InlineKeyboardButton("⛏️ DIG NOW", callback_data="dig")],
+                 [InlineKeyboardButton("🏆 LEADERBOARD", callback_data="leaderboard")]]
+    if offer:
+        keyboard.append([InlineKeyboardButton("🚀 OPEN OXSHARE", url=offer["affiliate_url"])])
+    keyboard.append([InlineKeyboardButton("🔗 MY REFERRAL LINK", callback_data="link")])
+    keyboard.append([InlineKeyboardButton("💎 PREMIUM WITH STARS", callback_data="stars")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def welcome_text(user, stats):
+    return (
+        "⛏️ *WELCOME TO STONEDIGGER* ⛏️\n\n"
+        f"*{user.first_name or 'Miner'}*\n"
+        "FREE\n\n"
+        f"📊 Activity: *{stats['activity_count']}*    "
+        f"🔥 Streak: *{stats['streak']}*    "
+        f"👥 Referrals: *{stats['referrals']}*\n\n"
+        "🎯 *TAP DIG NOW TO PLAY.*\n\n"
+        "💰 *EXPLORE THE SEPARATE OXSHARE OPPORTUNITY BELOW.*"
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ref = context.args[0] if context.args else None
     save_user(user, referrer=ref)
-    click_id = create_click(user.id, campaign_code=ref or "default")
     offer = get_oxshare_offer()
-
-    keyboard = []
     if offer:
-        keyboard.append([InlineKeyboardButton("🚀 Open Oxshare", url=offer["affiliate_url"])])
-    keyboard.append([InlineKeyboardButton("💎 Premium with Stars", callback_data="stars")])
-
-    text = (
-        f"Welcome to Stone, {user.first_name or 'there'}!\n\n"
-        "Your account is registered and your referral source has been tracked.\n\n"
-        f"Click ID: `{click_id}`\n\n"
-        "Choose an option below."
-    )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        create_click(user.id, campaign_code=ref or "default", offer_id=offer["id"])
+    stats = get_user_stats(user.id)
+    await update.message.reply_text(welcome_text(user, stats), parse_mode="Markdown", reply_markup=main_keyboard(offer))
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "/start — register and track referral\n"
-        "/link — generate your referral link\n"
-        "/stats — bot statistics (admin only)\n"
-        "/stars — buy Premium with Telegram Stars"
+        "/start — open StoneDigger\n"
+        "/link — get your referral link\n"
+        "/stats — admin statistics\n"
+        "/stars — Premium with Telegram Stars"
     )
 
 
@@ -159,7 +263,7 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(user)
     code = f"u{user.id}"
     link = f"https://t.me/{BOT_USERNAME}?start=ref_{code}"
-    await update.message.reply_text(f"Your referral link:\n{link}\n\nShare it to track referrals.")
+    await update.message.reply_text(f"🔗 Your StoneDigger referral link:\n{link}\n\nShare it and track your referrals.")
 
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -177,7 +281,7 @@ async def stars_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payload = f"premium:{update.effective_user.id}:{secrets.token_hex(8)}"
     await update.message.reply_invoice(
         title="Stone Premium",
-        description="Premium digital access inside Stone.",
+        description="Premium digital access inside StoneDigger.",
         payload=payload,
         currency="XTR",
         prices=[LabeledPrice("Premium", STARS_PRICE)],
@@ -187,7 +291,45 @@ async def stars_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data == "stars":
+    if query.data == "dig":
+        result = record_dig(query.from_user.id)
+        if not result:
+            await query.message.reply_text("Please send /start first.")
+            return
+        if not result["dug"]:
+            await query.message.reply_text(
+                "⏳ *YOU ALREADY DUG TODAY!*\n\n"
+                f"📊 Activity: *{result['activity']}*    🔥 Streak: *{result['streak']}*\n\n"
+                "Come back tomorrow to keep your streak alive.",
+                parse_mode="Markdown",
+            )
+            return
+        await query.message.reply_text(
+            "⛏️ *DIG COMPLETE!*\n\n"
+            f"📊 Activity: *{result['activity']}*    🔥 Streak: *{result['streak']}*\n\n"
+            "Keep your streak alive tomorrow.\n\n"
+            "💰 When you're ready, check the separate Oxshare opportunity below.",
+            parse_mode="Markdown",
+            reply_markup=main_keyboard(get_oxshare_offer()),
+        )
+    elif query.data == "leaderboard":
+        rows = leaderboard()
+        if not rows:
+            text = "🏆 *LEADERBOARD*\n\nNo miners yet."
+        else:
+            lines = ["🏆 *STONEDIGGER LEADERBOARD*", ""]
+            for i, row in enumerate(rows, start=1):
+                name = row["display_name"]
+                if len(name) > 24:
+                    name = name[:24]
+                lines.append(f"{i}. {name} — ⛏️{row['activity_count']} • 🔥{row['streak']}")
+            text = "\n".join(lines)
+        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard(get_oxshare_offer()))
+    elif query.data == "link":
+        code = f"u{query.from_user.id}"
+        link = f"https://t.me/{BOT_USERNAME}?start=ref_{code}"
+        await query.message.reply_text(f"🔗 Your referral link:\n{link}\n\nShare it to grow your referrals.")
+    elif query.data == "stars":
         await stars_cmd(update, context)
 
 
