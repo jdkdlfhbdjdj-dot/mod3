@@ -1,12 +1,13 @@
+import html
 import logging
 import os
 import secrets
 import threading
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 try:
     import stripe
@@ -30,6 +31,8 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 STARS_PRICE = int(os.environ.get("STARS_PRICE", "100"))
+ADMIN_DASHBOARD_USER = os.environ.get("ADMIN_DASHBOARD_USER", "")
+ADMIN_DASHBOARD_PASSWORD = os.environ.get("ADMIN_DASHBOARD_PASSWORD", "")
 
 app = Flask(__name__)
 
@@ -57,10 +60,9 @@ def init_db():
 def parse_referrer(ref):
     if not ref or not ref.startswith("ref_u"):
         return None
-    raw = ref[5:]
     try:
-        return int(raw)
-    except ValueError:
+        return int(ref[5:])
+    except (TypeError, ValueError):
         return None
 
 
@@ -69,7 +71,7 @@ def save_user(tg_user, referrer=None):
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT telegram_user_id, referrer_code, referred_by_telegram_user_id FROM public.users WHERE telegram_user_id=%s",
+                "SELECT telegram_user_id FROM public.users WHERE telegram_user_id=%s",
                 (tg_user.id,),
             )
             existing = cur.fetchone()
@@ -94,7 +96,11 @@ def save_user(tg_user, referrer=None):
                 )
             else:
                 cur.execute(
-                    "UPDATE public.users SET username=%s, first_name=%s, last_seen_at=now() WHERE telegram_user_id=%s",
+                    """
+                    UPDATE public.users
+                    SET username=%s, first_name=%s, last_seen_at=now()
+                    WHERE telegram_user_id=%s
+                    """,
                     (tg_user.username, tg_user.first_name, tg_user.id),
                 )
         conn.commit()
@@ -109,7 +115,8 @@ def get_user_stats(user_id):
             cur.execute(
                 """
                 SELECT activity_count, streak, last_dig_date,
-                       (SELECT COUNT(*) FROM public.users r WHERE r.referred_by_telegram_user_id = u.telegram_user_id) AS referrals
+                       (SELECT COUNT(*) FROM public.users r
+                        WHERE r.referred_by_telegram_user_id = u.telegram_user_id) AS referrals
                 FROM public.users u
                 WHERE telegram_user_id=%s
                 """,
@@ -134,11 +141,15 @@ def record_dig(user_id):
             today = date.today()
             last_dig = row["last_dig_date"]
             if last_dig == today:
-                return {"dug": False, "activity": row["activity_count"], "streak": row["streak"]}
+                return {"dug": False, "activity": row["activity_count"] or 0, "streak": row["streak"] or 0}
             new_streak = (row["streak"] or 0) + 1 if last_dig == today - timedelta(days=1) else 1
             new_activity = (row["activity_count"] or 0) + 1
             cur.execute(
-                "UPDATE public.users SET activity_count=%s, streak=%s, last_dig_date=%s, last_seen_at=now() WHERE telegram_user_id=%s",
+                """
+                UPDATE public.users
+                SET activity_count=%s, streak=%s, last_dig_date=%s, last_seen_at=now()
+                WHERE telegram_user_id=%s
+                """,
                 (new_activity, new_streak, today, user_id),
             )
         conn.commit()
@@ -152,8 +163,12 @@ def get_oxshare_offer():
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, name, affiliate_url FROM public.offers "
-                "WHERE lower(name)='oxshare' AND active=true ORDER BY id LIMIT 1"
+                """
+                SELECT id, name, affiliate_url
+                FROM public.offers
+                WHERE lower(name)='oxshare' AND active=true
+                ORDER BY id LIMIT 1
+                """
             )
             return cur.fetchone()
     finally:
@@ -206,7 +221,9 @@ def get_stats():
                 SELECT
                   (SELECT COUNT(*) FROM public.users) AS users,
                   (SELECT COUNT(*) FROM public.clicks) AS clicks,
+                  (SELECT COUNT(*) FROM public.users WHERE referred_by_telegram_user_id IS NOT NULL) AS referrals,
                   (SELECT COUNT(*) FROM public.conversions WHERE status IN ('approved','paid')) AS conversions,
+                  (SELECT COALESCE(SUM(amount),0) FROM public.conversions WHERE status IN ('approved','paid')) AS revenue,
                   (SELECT COALESCE(SUM(commission),0) FROM public.conversions WHERE status IN ('approved','paid')) AS commission
                 """
             )
@@ -216,12 +233,16 @@ def get_stats():
 
 
 def main_keyboard(offer):
-    keyboard = [[InlineKeyboardButton("⛏️ DIG NOW", callback_data="dig")],
-                 [InlineKeyboardButton("🏆 LEADERBOARD", callback_data="leaderboard")]]
+    keyboard = [
+        [InlineKeyboardButton("⛏️ DIG NOW", callback_data="dig")],
+        [InlineKeyboardButton("🏆 LEADERBOARD", callback_data="leaderboard")],
+    ]
     if offer:
         keyboard.append([InlineKeyboardButton("🚀 OPEN OXSHARE", url=offer["affiliate_url"])])
-    keyboard.append([InlineKeyboardButton("🔗 MY REFERRAL LINK", callback_data="link")])
-    keyboard.append([InlineKeyboardButton("💎 PREMIUM WITH STARS", callback_data="stars")])
+    keyboard.extend([
+        [InlineKeyboardButton("🔗 MY REFERRAL LINK", callback_data="link")],
+        [InlineKeyboardButton("💎 PREMIUM WITH STARS", callback_data="stars")],
+    ])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -230,9 +251,9 @@ def welcome_text(user, stats):
         "⛏️ *WELCOME TO STONEDIGGER* ⛏️\n\n"
         f"*{user.first_name or 'Miner'}*\n"
         "FREE\n\n"
-        f"📊 Activity: *{stats['activity_count']}*    "
-        f"🔥 Streak: *{stats['streak']}*    "
-        f"👥 Referrals: *{stats['referrals']}*\n\n"
+        f"📊 Activity: *{stats['activity_count'] or 0}*    "
+        f"🔥 Streak: *{stats['streak'] or 0}*    "
+        f"👥 Referrals: *{stats['referrals'] or 0}*\n\n"
         "🎯 *TAP DIG NOW TO PLAY.*\n\n"
         "💰 *EXPLORE THE SEPARATE OXSHARE OPPORTUNITY BELOW.*"
     )
@@ -246,7 +267,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if offer:
         create_click(user.id, campaign_code=ref or "default", offer_id=offer["id"])
     stats = get_user_stats(user.id)
-    await update.message.reply_text(welcome_text(user, stats), parse_mode="Markdown", reply_markup=main_keyboard(offer))
+    await update.message.reply_text(
+        welcome_text(user, stats),
+        parse_mode="Markdown",
+        reply_markup=main_keyboard(offer),
+    )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -261,9 +286,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user)
-    code = f"u{user.id}"
-    link = f"https://t.me/{BOT_USERNAME}?start=ref_{code}"
-    await update.message.reply_text(f"🔗 Your StoneDigger referral link:\n{link}\n\nShare it and track your referrals.")
+    link = f"https://t.me/{BOT_USERNAME}?start=ref_u{user.id}"
+    await update.message.reply_text(
+        f"🔗 Your StoneDigger referral link:\n{link}\n\nShare it and track your referrals."
+    )
 
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -273,7 +299,9 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     s = get_stats()
     await update.message.reply_text(
-        f"Users: {s['users']}\nClicks: {s['clicks']}\nConversions: {s['conversions']}\nCommission: {float(s['commission'] or 0):.2f}"
+        f"Users: {s['users']}\nClicks: {s['clicks']}\nReferrals: {s['referrals']}\n"
+        f"Conversions: {s['conversions']}\nRevenue: {float(s['revenue'] or 0):.2f}\n"
+        f"Commission: {float(s['commission'] or 0):.2f}"
     )
 
 
@@ -308,27 +336,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⛏️ *DIG COMPLETE!*\n\n"
             f"📊 Activity: *{result['activity']}*    🔥 Streak: *{result['streak']}*\n\n"
             "Keep your streak alive tomorrow.\n\n"
-            "💰 When you're ready, check the separate Oxshare opportunity below.",
+            "💰 Check the separate Oxshare opportunity below.",
             parse_mode="Markdown",
             reply_markup=main_keyboard(get_oxshare_offer()),
         )
     elif query.data == "leaderboard":
         rows = leaderboard()
-        if not rows:
-            text = "🏆 *LEADERBOARD*\n\nNo miners yet."
-        else:
-            lines = ["🏆 *STONEDIGGER LEADERBOARD*", ""]
-            for i, row in enumerate(rows, start=1):
-                name = row["display_name"]
-                if len(name) > 24:
-                    name = name[:24]
-                lines.append(f"{i}. {name} — ⛏️{row['activity_count']} • 🔥{row['streak']}")
-            text = "\n".join(lines)
-        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard(get_oxshare_offer()))
+        lines = ["🏆 *STONEDIGGER LEADERBOARD*", ""]
+        for i, row in enumerate(rows, 1):
+            name = str(row["display_name"] or "Miner")[:24]
+            lines.append(f"{i}. {name} — ⛏️{row['activity_count'] or 0} • 🔥{row['streak'] or 0}")
+        if len(lines) == 2:
+            lines.append("No miners yet.")
+        await query.message.reply_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=main_keyboard(get_oxshare_offer()),
+        )
     elif query.data == "link":
-        code = f"u{query.from_user.id}"
-        link = f"https://t.me/{BOT_USERNAME}?start=ref_{code}"
-        await query.message.reply_text(f"🔗 Your referral link:\n{link}\n\nShare it to grow your referrals.")
+        link = f"https://t.me/{BOT_USERNAME}?start=ref_u{query.from_user.id}"
+        await query.message.reply_text(f"🔗 Your StoneDigger referral link:\n{link}\n\nShare it to grow your referrals.")
     elif query.data == "stars":
         await stars_cmd(update, context)
 
@@ -348,6 +375,89 @@ def stripe_checkout(click_id, user_id):
     return session.url
 
 
+def dashboard_auth():
+    auth = request.authorization
+    if (
+        not ADMIN_DASHBOARD_USER
+        or not ADMIN_DASHBOARD_PASSWORD
+        or not auth
+        or auth.username != ADMIN_DASHBOARD_USER
+        or auth.password != ADMIN_DASHBOARD_PASSWORD
+    ):
+        return Response(
+            "Admin login required.",
+            401,
+            {"WWW-Authenticate": 'Basic realm="StoneDigger Admin"'},
+        )
+    return None
+
+
+def dashboard_data():
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            kpis = cur.execute(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM public.users) AS users,
+                  (SELECT COUNT(*) FROM public.users WHERE created_at >= now() - interval '24 hours') AS users_24h,
+                  (SELECT COUNT(*) FROM public.clicks) AS clicks,
+                  (SELECT COUNT(*) FROM public.clicks WHERE created_at >= now() - interval '24 hours') AS clicks_24h,
+                  (SELECT COUNT(*) FROM public.users WHERE referred_by_telegram_user_id IS NOT NULL) AS referrals,
+                  (SELECT COUNT(*) FROM public.conversions WHERE status IN ('approved','paid')) AS conversions,
+                  (SELECT COALESCE(SUM(amount),0) FROM public.conversions WHERE status IN ('approved','paid')) AS revenue,
+                  (SELECT COALESCE(SUM(commission),0) FROM public.conversions WHERE status IN ('approved','paid')) AS commission
+                """
+            ) or None
+            kpis = cur.fetchone()
+            cur.execute(
+                """
+                SELECT COALESCE(u.username, u.first_name, 'Miner') AS name,
+                       COUNT(r.telegram_user_id) AS referrals,
+                       COALESCE(u.activity_count,0) AS activity,
+                       COALESCE(u.streak,0) AS streak
+                FROM public.users u
+                LEFT JOIN public.users r ON r.referred_by_telegram_user_id = u.telegram_user_id
+                GROUP BY u.telegram_user_id, u.username, u.first_name, u.activity_count, u.streak
+                ORDER BY referrals DESC, activity DESC, u.created_at ASC LIMIT 20
+                """
+            )
+            top_referrers = cur.fetchall()
+            cur.execute(
+                """
+                SELECT COALESCE(username, first_name, 'Miner') AS name,
+                       telegram_user_id, activity_count, streak,
+                       referred_by_telegram_user_id, created_at, last_seen_at
+                FROM public.users ORDER BY created_at DESC LIMIT 20
+                """
+            )
+            users = cur.fetchall()
+            cur.execute(
+                """
+                SELECT c.click_id, c.telegram_user_id, c.campaign_code,
+                       COALESCE(o.name,'—') AS offer, c.created_at
+                FROM public.clicks c LEFT JOIN public.offers o ON o.id=c.offer_id
+                ORDER BY c.created_at DESC LIMIT 20
+                """
+            )
+            clicks = cur.fetchall()
+            cur.execute(
+                """
+                SELECT click_id, telegram_user_id, provider, amount, currency,
+                       commission, status, created_at
+                FROM public.conversions ORDER BY created_at DESC LIMIT 20
+                """
+            )
+            conversions = cur.fetchall()
+            cur.execute(
+                "SELECT name, affiliate_url, active FROM public.offers WHERE lower(name)='oxshare' ORDER BY id LIMIT 1"
+            )
+            offer = cur.fetchone()
+    finally:
+        conn.close()
+    return kpis, top_referrers, users, clicks, conversions, offer
+
+
 @app.get("/")
 def home():
     return jsonify({"service": "StoneDigger", "status": "ok", "stats": get_stats()})
@@ -362,6 +472,107 @@ def health():
     except Exception as exc:
         log.exception("Database health check failed")
         return jsonify({"status": "unhealthy", "database": "error", "error": str(exc)}), 503
+
+
+@app.get("/dashboard")
+def dashboard():
+    auth_error = dashboard_auth()
+    if auth_error:
+        return auth_error
+    try:
+        kpis, top_referrers, users, clicks, conversions, offer = dashboard_data()
+    except Exception as exc:
+        log.exception("Dashboard query failed")
+        return jsonify({"error": "dashboard_query_failed", "detail": str(exc)}), 500
+
+    def e(v):
+        return html.escape(str(v if v is not None else ""))
+
+    def n(v):
+        return int(v or 0)
+
+    def money(v):
+        try:
+            return f"{float(v or 0):,.2f}"
+        except Exception:
+            return "0.00"
+
+    conversion_rate = (n(kpis["conversions"]) / n(kpis["clicks"]) * 100) if n(kpis["clicks"]) else 0
+    referral_rate = (n(kpis["referrals"]) / n(kpis["users"]) * 100) if n(kpis["users"]) else 0
+    offer_state = "Not found"
+    offer_url = ""
+    if offer:
+        offer_state = "ACTIVE" if offer["active"] else "INACTIVE"
+        offer_url = e(offer["affiliate_url"])
+
+    top_rows = "".join(
+        f"<tr><td>{i}</td><td>{e(r['name'])}</td><td>{n(r['referrals'])}</td><td>{n(r['activity'])}</td><td>{n(r['streak'])}</td></tr>"
+        for i, r in enumerate(top_referrers, 1)
+    ) or '<tr><td colspan="5" class="muted">No referral data yet.</td></tr>'
+
+    user_rows = "".join(
+        f"<tr><td>{e(r['name'])}</td><td>{r['telegram_user_id']}</td><td>{n(r['activity_count'])}</td>"
+        f"<td>{n(r['streak'])}</td><td>{'Yes' if r['referred_by_telegram_user_id'] else 'No'}</td>"
+        f"<td>{e(r['created_at'])}</td></tr>"
+        for r in users
+    ) or '<tr><td colspan="6" class="muted">No users yet.</td></tr>'
+
+    click_rows = "".join(
+        f"<tr><td><code>{e(r['click_id'])}</code></td><td>{r['telegram_user_id']}</td>"
+        f"<td>{e(r['campaign_code'])}</td><td>{e(r['offer'])}</td><td>{e(r['created_at'])}</td></tr>"
+        for r in clicks
+    ) or '<tr><td colspan="5" class="muted">No clicks yet.</td></tr>'
+
+    conversion_rows = "".join(
+        f"<tr><td><code>{e(r['click_id'])}</code></td><td>{r['telegram_user_id']}</td><td>{e(r['provider'])}</td>"
+        f"<td>{money(r['amount'])} {e(r['currency'])}</td><td>{money(r['commission'])}</td>"
+        f"<td>{e(r['status'])}</td><td>{e(r['created_at'])}</td></tr>"
+        for r in conversions
+    ) or '<tr><td colspan="7" class="muted">No conversions yet.</td></tr>'
+
+    page = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>StoneDigger Admin Dashboard</title>
+<style>
+:root{{font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;background:#0b1020;color:#eef2ff}}
+body{{margin:0;background:linear-gradient(180deg,#0b1020,#131a2e);min-height:100vh}}
+.container{{max-width:1250px;margin:auto;padding:28px}}
+.header{{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:24px}}
+h1{{margin:0;font-size:30px}} .sub{{color:#9aa6c1;margin-top:7px}}
+.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px}}
+.card{{background:#151d33;border:1px solid #293552;border-radius:16px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.18)}}
+.kpi{{font-size:30px;font-weight:800;margin-top:7px}} .label{{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#8f9ab4}}
+.small{{font-size:12px;color:#91a0bd;margin-top:5px}}
+.section{{margin-top:18px}} .section h2{{font-size:18px;margin:0 0 10px}}
+table{{width:100%;border-collapse:collapse;font-size:13px}} th,td{{padding:10px 9px;border-bottom:1px solid #26314b;text-align:left;white-space:nowrap}} th{{color:#aab6d1;font-size:11px;text-transform:uppercase;letter-spacing:.06em}}
+.scroll{{overflow:auto;border:1px solid #293552;border-radius:14px}} code{{color:#b9c6ff}} .muted{{color:#73809d;text-align:center;padding:20px}}
+.pill{{display:inline-block;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:700;background:#163f2b;color:#77e3a8}}
+.offer-url{{color:#9eacd0;font-size:12px;word-break:break-all;max-width:700px;display:inline-block}}
+@media(max-width:900px){{.grid{{grid-template-columns:repeat(2,1fr)}}}}
+@media(max-width:600px){{.container{{padding:16px}}.grid{{grid-template-columns:1fr}}h1{{font-size:24px}}}}
+</style>
+</head>
+<body><div class="container">
+<div class="header"><div><h1>⛏️ StoneDigger Admin</h1><div class="sub">Sales, referrals, engagement and conversion monitoring</div></div>
+<div><span class="pill">OXSHARE {e(offer_state)}</span><div class="offer-url">{offer_url}</div></div></div>
+<div class="grid">
+<div class="card"><div class="label">Total Users</div><div class="kpi">{n(kpis['users'])}</div><div class="small">+{n(kpis['users_24h'])} in 24h</div></div>
+<div class="card"><div class="label">Total Clicks</div><div class="kpi">{n(kpis['clicks'])}</div><div class="small">+{n(kpis['clicks_24h'])} in 24h</div></div>
+<div class="card"><div class="label">Referrals</div><div class="kpi">{n(kpis['referrals'])}</div><div class="small">Tracked invited users</div></div>
+<div class="card"><div class="label">Conversions</div><div class="kpi">{n(kpis['conversions'])}</div><div class="small">Approved / paid</div></div>
+<div class="card"><div class="label">Revenue</div><div class="kpi">{money(kpis['revenue'])}</div><div class="small">Recorded paid/approved</div></div>
+<div class="card"><div class="label">Commission</div><div class="kpi">{money(kpis['commission'])}</div><div class="small">Recorded commission</div></div>
+<div class="card"><div class="label">Click → Conversion</div><div class="kpi">{conversion_rate:.1f}%</div><div class="small">Overall conversion rate</div></div>
+<div class="card"><div class="label">Referral → User</div><div class="kpi">{referral_rate:.1f}%</div><div class="small">Users acquired by referral</div></div>
+</div>
+<div class="section card"><h2>🏆 Top Referrers</h2><div class="scroll"><table><thead><tr><th>#</th><th>User</th><th>Referrals</th><th>Activity</th><th>Streak</th></tr></thead><tbody>{top_rows}</tbody></table></div></div>
+<div class="section card"><h2>👥 Recent Users</h2><div class="scroll"><table><thead><tr><th>User</th><th>Telegram ID</th><th>Activity</th><th>Streak</th><th>Referred</th><th>Created</th></tr></thead><tbody>{user_rows}</tbody></table></div></div>
+<div class="section card"><h2>🔗 Recent Clicks</h2><div class="scroll"><table><thead><tr><th>Click ID</th><th>Telegram ID</th><th>Campaign</th><th>Offer</th><th>Created</th></tr></thead><tbody>{click_rows}</tbody></table></div></div>
+<div class="section card"><h2>💰 Recent Conversions</h2><div class="scroll"><table><thead><tr><th>Click ID</th><th>Telegram ID</th><th>Provider</th><th>Amount</th><th>Commission</th><th>Status</th><th>Created</th></tr></thead><tbody>{conversion_rows}</tbody></table></div></div>
+</div></body></html>"""
+    return Response(page, mimetype="text/html")
 
 
 @app.get("/success")
@@ -402,7 +613,6 @@ def stripe_webhook():
     except Exception as exc:
         log.warning("Stripe webhook rejected: %s", exc)
         return jsonify({"error": "invalid_signature"}), 400
-
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
         metadata = session.get("metadata", {})
@@ -460,9 +670,8 @@ def main():
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("stars", stars_cmd))
     application.add_handler(CallbackQueryHandler(button_callback))
-
     threading.Thread(target=run_http, daemon=True).start()
-    log.info("StoneDigger starting with Supabase PostgreSQL and Oxshare only")
+    log.info("StoneDigger starting with Supabase PostgreSQL, Oxshare only, and admin dashboard")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
