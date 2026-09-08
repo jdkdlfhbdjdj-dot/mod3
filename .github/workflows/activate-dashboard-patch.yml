@@ -12,25 +12,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Add dashboard patch import
+      - name: Fix and activate dashboard patch
         shell: bash
         run: |
-          if ! grep -q '^import dashboard_patch$' app.py; then
-            python - <<'PY'
+          python - <<'PY'
 from pathlib import Path
-p = Path('app.py')
-s = p.read_text()
-needle = '\nif __name__ == "__main__":\n    main()\n'
-if needle not in s:
-    raise SystemExit('Could not locate app.py entrypoint')
-s = s.replace(needle, '\nimport dashboard_patch\n\nif __name__ == "__main__":\n    main()\n')
-p.write_text(s)
+
+patch = Path('dashboard_patch.py')
+s = patch.read_text()
+s = s.replace('def enhanced_start(update, context):', 'async def enhanced_start(update, context):', 1)
+patch.write_text(s)
+
+app = Path('app.py')
+s = app.read_text()
+if 'import dashboard_patch' not in s:
+    needle = '\nif __name__ == "__main__":\n    main()\n'
+    if needle not in s:
+        raise SystemExit('Could not locate app.py entrypoint')
+    s = s.replace(needle, '\nimport dashboard_patch\n\nif __name__ == "__main__":\n    main()\n', 1)
+    app.write_text(s)
+
+# Make /link generate a campaign-ready personal link while keeping the same referral ID.
+if 'Share it and track your referrals.' in s:
+    s = s.replace('Share it and track your referrals.', 'Use the Command Center to create campaign-specific links for Facebook, Instagram and Telegram.', 1)
+    app.write_text(s)
 PY
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add app.py
-            git commit -m 'Activate enhanced dashboard at startup'
-            git push
-          else
-            echo 'dashboard_patch already active'
+          if git diff --quiet; then
+            echo 'No changes needed'
+            exit 0
           fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app.py dashboard_patch.py
+          git commit -m 'Activate stable campaign dashboard'
+          git push
