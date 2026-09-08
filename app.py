@@ -1,10 +1,8 @@
 import logging
 import os
 import secrets
-import sqlite3
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request
@@ -15,6 +13,13 @@ try:
     import stripe
 except ImportError:
     stripe = None
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:
+    psycopg = None
+    dict_row = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("stonedigger")
@@ -28,79 +33,28 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 STARS_PRICE = int(os.environ.get("STARS_PRICE", "100"))
 
 app = Flask(__name__)
-DB_PATH = os.environ.get("SQLITE_PATH", "/tmp/stonedigger.db")
 
 
 def db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if not psycopg:
+        raise RuntimeError("psycopg is required")
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is required")
+    # Supabase's Session Pooler is IPv4-compatible and suitable for Render.
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 def init_db():
+    # Schema is managed in Supabase migrations. This check keeps startup explicit.
     conn = db()
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_user_id INTEGER UNIQUE NOT NULL,
-            username TEXT,
-            first_name TEXT,
-            referrer_code TEXT,
-            created_at INTEGER NOT NULL,
-            last_seen_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS campaigns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            active INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS offers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            campaign_id INTEGER,
-            name TEXT NOT NULL,
-            affiliate_url TEXT NOT NULL,
-            commission_percent REAL NOT NULL DEFAULT 0,
-            active INTEGER NOT NULL DEFAULT 1,
-            FOREIGN KEY(campaign_id) REFERENCES campaigns(id)
-        );
-        CREATE TABLE IF NOT EXISTS clicks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            click_id TEXT UNIQUE NOT NULL,
-            telegram_user_id INTEGER NOT NULL,
-            campaign_code TEXT,
-            offer_id INTEGER,
-            created_at INTEGER NOT NULL,
-            FOREIGN KEY(offer_id) REFERENCES offers(id)
-        );
-        CREATE TABLE IF NOT EXISTS conversions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            click_id TEXT,
-            telegram_user_id INTEGER,
-            provider TEXT NOT NULL,
-            external_id TEXT UNIQUE NOT NULL,
-            amount REAL NOT NULL DEFAULT 0,
-            currency TEXT NOT NULL DEFAULT 'USD',
-            commission REAL NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at INTEGER NOT NULL,
-            FOREIGN KEY(click_id) REFERENCES clicks(click_id)
-        );
-        CREATE TABLE IF NOT EXISTS stars_payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_user_id INTEGER NOT NULL,
-            payload TEXT UNIQUE NOT NULL,
-            charge_id TEXT,
-            amount INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            created_at INTEGER NOT NULL
-        );
-        """
-    )
-    conn.execute("INSERT OR IGNORE INTO campaigns(code,name) VALUES(?,?)", ("default", "Default Campaign"))
-    conn.commit()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.users') AS users_table")
+            row = cur.fetchone()
+            if not row or row["users_table"] != "users":
+                raise RuntimeError("Supabase schema is missing public.users")
+    finally:
+        conn.close()
 
 
 def now():
@@ -109,40 +63,57 @@ def now():
 
 def save_user(tg_user, referrer=None):
     conn = db()
-    existing = conn.execute("SELECT referrer_code FROM users WHERE telegram_user_id=?", (tg_user.id,)).fetchone()
-    if existing is None:
-        conn.execute(
-            "INSERT INTO users(telegram_user_id,username,first_name,referrer_code,created_at,last_seen_at) VALUES(?,?,?,?,?,?)",
-            (tg_user.id, tg_user.username, tg_user.first_name, referrer, now(), now()),
-        )
-    else:
-        conn.execute(
-            "UPDATE users SET username=?, first_name=?, last_seen_at=? WHERE telegram_user_id=?",
-            (tg_user.username, tg_user.first_name, now(), tg_user.id),
-        )
-    conn.commit()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT referrer_code FROM public.users WHERE telegram_user_id=%s", (tg_user.id,))
+            existing = cur.fetchone()
+            if existing is None:
+                cur.execute(
+                    "INSERT INTO public.users(telegram_user_id,username,first_name,referrer_code) VALUES(%s,%s,%s,%s)",
+                    (tg_user.id, tg_user.username, tg_user.first_name, referrer),
+                )
+            else:
+                cur.execute(
+                    "UPDATE public.users SET username=%s, first_name=%s, last_seen_at=now() WHERE telegram_user_id=%s",
+                    (tg_user.username, tg_user.first_name, tg_user.id),
+                )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def create_click(user_id, campaign_code="default", offer_id=None):
     click_id = secrets.token_urlsafe(12).replace("-", "").replace("_", "")[:16]
     conn = db()
-    conn.execute(
-        "INSERT INTO clicks(click_id,telegram_user_id,campaign_code,offer_id,created_at) VALUES(?,?,?,?,?)",
-        (click_id, user_id, campaign_code, offer_id, now()),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO public.clicks(click_id,telegram_user_id,campaign_code,offer_id) VALUES(%s,%s,%s,%s)",
+                (click_id, user_id, campaign_code, offer_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
     return click_id
 
 
 def get_stats():
     conn = db()
-    row = conn.execute(
-        "SELECT (SELECT COUNT(*) FROM users) users,(SELECT COUNT(*) FROM clicks) clicks,(SELECT COUNT(*) FROM conversions WHERE status='confirmed') conversions,(SELECT COALESCE(SUM(commission),0) FROM conversions WHERE status='confirmed') commission"
-    ).fetchone()
-    conn.close()
-    return dict(row)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM public.users) AS users,
+                  (SELECT COUNT(*) FROM public.clicks) AS clicks,
+                  (SELECT COUNT(*) FROM public.conversions WHERE status IN ('approved','paid')) AS conversions,
+                  (SELECT COALESCE(SUM(commission),0) FROM public.conversions WHERE status IN ('approved','paid')) AS commission
+                """
+            )
+            row = cur.fetchone()
+            return dict(row)
+    finally:
+        conn.close()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -189,7 +160,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     s = get_stats()
     await update.message.reply_text(
-        f"Users: {s['users']}\nClicks: {s['clicks']}\nConfirmed conversions: {s['conversions']}\nCommission: {s['commission']:.2f}"
+        f"Users: {s['users']}\nClicks: {s['clicks']}\nConversions: {s['conversions']}\nCommission: {float(s['commission'] or 0):.2f}"
     )
 
 
@@ -226,7 +197,13 @@ def home():
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "healthy"})
+    try:
+        conn = db()
+        conn.close()
+        return jsonify({"status": "healthy", "database": "ok"})
+    except Exception as exc:
+        log.exception("Database health check failed")
+        return jsonify({"status": "unhealthy", "database": "error", "error": str(exc)}), 503
 
 
 @app.get("/success")
@@ -242,8 +219,12 @@ def cancel():
 @app.get("/buy/<click_id>")
 def buy(click_id):
     conn = db()
-    click = conn.execute("SELECT * FROM clicks WHERE click_id=?", (click_id,)).fetchone()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM public.clicks WHERE click_id=%s", (click_id,))
+            click = cur.fetchone()
+    finally:
+        conn.close()
     if not click:
         return jsonify({"error": "invalid_click_id"}), 404
     url = stripe_checkout(click_id, click["telegram_user_id"])
@@ -272,18 +253,29 @@ def stripe_webhook():
         external_id = session.get("id")
         amount = (session.get("amount_total") or 0) / 100
         conn = db()
-        click = conn.execute("SELECT offer_id FROM clicks WHERE click_id=?", (click_id,)).fetchone()
-        commission = 0
-        if click and click["offer_id"]:
-            offer = conn.execute("SELECT commission_percent FROM offers WHERE id=?", (click["offer_id"],)).fetchone()
-            if offer:
-                commission = amount * float(offer["commission_percent"]) / 100
-        conn.execute(
-            "INSERT OR IGNORE INTO conversions(click_id,telegram_user_id,provider,external_id,amount,currency,commission,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (click_id, int(user_id) if user_id else None, "stripe", external_id, amount, session.get("currency", "usd").upper(), commission, "confirmed", now()),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT offer_id FROM public.clicks WHERE click_id=%s", (click_id,))
+                click = cur.fetchone()
+                commission = 0
+                if click and click["offer_id"]:
+                    cur.execute("SELECT commission_percent FROM public.offers WHERE id=%s", (click["offer_id"],))
+                    offer = cur.fetchone()
+                    if offer:
+                        commission = amount * float(offer["commission_percent"]) / 100
+                cur.execute(
+                    """
+                    INSERT INTO public.conversions
+                    (click_id,telegram_user_id,provider,external_id,amount,currency,commission,status)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (external_id) DO NOTHING
+                    """,
+                    (click_id, int(user_id) if user_id else None, "stripe", external_id, amount,
+                     session.get("currency", "usd").upper(), commission, "approved"),
+                )
+            conn.commit()
+        finally:
+            conn.close()
     return jsonify({"received": True})
 
 
@@ -300,6 +292,8 @@ def run_http():
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is required")
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is required")
     init_db()
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
@@ -309,7 +303,7 @@ def main():
     application.add_handler(CommandHandler("stars", stars_cmd))
 
     threading.Thread(target=run_http, daemon=True).start()
-    log.info("StoneDigger starting")
+    log.info("StoneDigger starting with Supabase PostgreSQL")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
