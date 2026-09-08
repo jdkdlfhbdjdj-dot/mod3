@@ -3,7 +3,7 @@ services:
     name: stonedigger-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python -c "import app; import dashboard_patch; app.main()"
+    startCommand: python -c "import app; import command_center; app.main()"
     healthCheckPath: /health
     envVars:
       - key: BOT_TOKEN
@@ -12,7 +12,13 @@ services:
         value: Stonedigger_bot
       - key: PUBLIC_BASE_URL
         sync: false
+      - key: DATABASE_URL
+        sync: false
       - key: ADMIN_TELEGRAM_IDS
+        sync: false
+      - key: ADMIN_DASHBOARD_USER
+        sync: false
+      - key: ADMIN_DASHBOARD_PASSWORD
         sync: false
       - key: STRIPE_SECRET_KEY
         sync: false
